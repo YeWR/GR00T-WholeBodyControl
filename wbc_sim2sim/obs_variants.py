@@ -35,6 +35,9 @@ def install_obs_variant_patches(obs_dim: int) -> None:
         if hasattr(ll_obs, "_orig_build_actor_obs"):
             ll_obs.build_actor_obs = ll_obs._orig_build_actor_obs
         ll_config.ObsCfg.total_dim = 308  # type: ignore[attr-defined]
+        import sim2sim.policy as ll_policy
+        if hasattr(ll_policy, "_orig_load_policy"):
+            ll_policy.load_policy = ll_policy._orig_load_policy
         try:
             import scripts.run_mujoco as rm
             if hasattr(rm, "_orig_load_policy"):
@@ -73,8 +76,11 @@ def install_obs_variant_patches(obs_dim: int) -> None:
         rm._orig_load_policy = rm.load_policy
     rm.build_actor_obs = build_balance_obs
 
-    from sim2sim.policy import load_policy as _orig_load
+    import sim2sim.policy as ll_policy
+    if not hasattr(ll_policy, "_orig_load_policy"):
+        ll_policy._orig_load_policy = ll_policy.load_policy
     def load_policy_284(ckpt_path, **kw):
         kw.setdefault("obs_dim", 284)
-        return _orig_load(ckpt_path, **kw)
+        return ll_policy._orig_load_policy(ckpt_path, **kw)
     rm.load_policy = load_policy_284
+    ll_policy.load_policy = load_policy_284  # so wbc_sim2sim.bridge's `_ll_policy.load_policy(...)` picks it up

@@ -28,8 +28,12 @@ if str(LEGGED_SIM2SIM_DIR) not in sys.path:
     sys.path.insert(0, str(LEGGED_SIM2SIM_DIR))
 
 from sim2sim.config import DEFAULT_QPOS, KD, KP, HeightScanCfg, ObsCfg  # noqa: E402
-from sim2sim.obs_builder import RobotState, build_actor_obs  # noqa: E402
-from sim2sim.policy import load_policy  # noqa: E402
+from sim2sim.obs_builder import RobotState  # noqa: E402
+# Import the modules (not the functions) so ``install_obs_variant_patches``
+# can override ``sim2sim.{obs_builder.build_actor_obs, policy.load_policy}``
+# after import and the bridge still picks up overrides at call time.
+import sim2sim.obs_builder as _ll_obs  # noqa: E402
+import sim2sim.policy as _ll_policy  # noqa: E402
 
 from .command_source import Command, CommandSource, FixedCommand  # noqa: E402
 from .fk import FKHelper  # noqa: E402
@@ -39,6 +43,7 @@ from .joint_mapping import (  # noqa: E402
     isaac_to_sdk_perm,
     sdk_to_isaac_perm,
 )
+from .safety import SafetyCfg, SafetyMonitor  # noqa: E402
 from .state_cache import StateCache  # noqa: E402
 
 
@@ -59,6 +64,14 @@ class BridgeCfg:
     # already holds the robot at default during policy load; keep this small
     # so we hand off to the policy while the robot is still upright.
     warmup_steps: int = 5
+    # Optional shadow-render video output — bridge loads a second MuJoCo
+    # MjModel (the FKHelper's), syncs qpos from every lowstate / odostate,
+    # renders at 50 fps via EGL offscreen.
+    video_path: str | None = None
+    video_res: str = "960x540"
+    # Runtime safety: tilt / root-z triggered kp/kd taper.
+    safety: SafetyCfg | None = None
+    enable_safety: bool = True
 
 
 class Bridge:
@@ -100,6 +113,17 @@ class Bridge:
         self.prev_action_isaac = None
         self._hold_stop = threading.Event()
         self._hold_thread: threading.Thread | None = None
+        # Shadow-render video (lazy init in _init_video).
+        self._video_writer = None
+        self._renderer = None
+        self._cam_id = -1
+        # Safety monitor — None means disabled via cfg.enable_safety=False.
+        self._safety: SafetyMonitor | None = (
+            SafetyMonitor(self.cfg.safety) if self.cfg.enable_safety else None
+        )
+        # Per-step kp/kd scale (1.0 healthy, ↘ 0 during fall taper).
+        self._kp_sdk = None  # set in _prime_lowcmd
+        self._kd_sdk = None
 
     # ------------------------------------------------------------------ SDK
 
@@ -144,6 +168,8 @@ class Bridge:
         # (that's our convention). For Kp we want sdk-order values, so indexing
         # Isaac-order KP by p gives us the right thing.
         kd_sdk = KD[p].astype(np.float32)
+        self._kp_sdk = kp_sdk
+        self._kd_sdk = kd_sdk
         for i in range(29):
             m = self._lowcmd_msg.motor_cmd[i]
             m.mode = 1  # PMSM enabled
@@ -197,7 +223,7 @@ class Bridge:
             "right_ee_rpy": command.right_ee_rpy,
             "target_h": command.target_h,
         }
-        return build_actor_obs(
+        return _ll_obs.build_actor_obs(
             robot_state, cmd_dict, self.prev_action_isaac, self.obs_cfg, self.scan_cfg
         )
 
@@ -236,6 +262,49 @@ class Bridge:
         if self._hold_thread is not None:
             self._hold_thread.join(timeout=1.0)
 
+    def _init_video(self) -> None:
+        if not self.cfg.video_path:
+            return
+        import os as _os
+        _os.environ.setdefault("MUJOCO_GL", "egl")
+        import imageio.v2 as imageio
+        import mujoco
+        from pathlib import Path as _Path
+
+        w, h = (int(x) for x in self.cfg.video_res.lower().split("x"))
+        # The FKHelper's model was already loaded for kinematics; reuse it.
+        model = self.fk.model
+        model.vis.global_.offwidth = max(int(model.vis.global_.offwidth), w)
+        model.vis.global_.offheight = max(int(model.vis.global_.offheight), h)
+        self._renderer = mujoco.Renderer(model, height=h, width=w)
+        _Path(self.cfg.video_path).parent.mkdir(parents=True, exist_ok=True)
+        self._video_writer = imageio.get_writer(
+            self.cfg.video_path,
+            fps=int(self.cfg.control_hz),
+            codec="libx264", quality=8, macro_block_size=1,
+        )
+
+    def _render_frame(self) -> None:
+        """Render one frame of the FK-side MuJoCo (already has current qpos from
+        the latest _build_obs call)."""
+        if self._renderer is None or self._video_writer is None:
+            return
+        import mujoco
+        cam = mujoco.MjvCamera()
+        mujoco.mjv_defaultFreeCamera(self.fk.model, cam)
+        cam.lookat[:] = self.fk.data.xpos[self.fk._pelvis]
+        cam.distance = 3.0
+        cam.azimuth = 135.0
+        cam.elevation = -20.0
+        self._renderer.update_scene(self.fk.data, camera=cam)
+        self._video_writer.append_data(self._renderer.render())
+
+    def _close_video(self) -> None:
+        if self._video_writer is not None:
+            self._video_writer.close()
+            print(f"[bridge] saved video to {self.cfg.video_path}")
+            self._video_writer = None
+
     def run(self, max_steps: int | None = None) -> None:
         # 1. Bring up DDS channels ASAP so we can start publishing a holding
         #    command within ~100 ms of sim start — before gravity collapses
@@ -245,7 +314,7 @@ class Bridge:
         # 2. Heavy imports: load the RSL-RL policy (MuJoCo + torch, ~2 s on cpu,
         #    longer first time on cuda). The hold thread keeps publishing.
         self.fk = FKHelper()
-        self.policy = load_policy(self.cfg.ckpt_path, device=self.cfg.device)
+        self.policy = _ll_policy.load_policy(self.cfg.ckpt_path, device=self.cfg.device)
         self.hidden = self.policy.reset(batch=1)
         self.prev_action_isaac = np.zeros(self.policy.io.action_dim, dtype=np.float32)
         # 3. Sync: ensure we actually got lowstate from the sim.
@@ -257,6 +326,7 @@ class Bridge:
         print("[bridge] first lowstate received. Starting policy loop.")
         # 4. Hand control to the main loop below.
         self._stop_default_hold_thread()
+        self._init_video()
 
         period = 1.0 / self.cfg.control_hz
         default_sdk = DEFAULT_QPOS[self.isaac2sdk].astype(np.float32)
@@ -275,6 +345,7 @@ class Bridge:
             time.sleep(period)
 
         step = 0
+        self._t_elapsed = 0.0
         next_tick = time.monotonic()
         try:
             while max_steps is None or step < max_steps:
@@ -284,20 +355,33 @@ class Bridge:
                 if age > self.cfg.stale_warn_s:
                     print(f"[bridge] warning: lowstate {age*1000:.0f} ms stale")
 
-                cmd = self.command.current()
+                cmd = self.command.current(self._t_elapsed)
                 obs = self._build_obs(snap, cmd)
                 action_isaac, self.hidden = self.policy.act(obs, self.hidden)
                 np.clip(action_isaac, -self.cfg.clip_action, self.cfg.clip_action, out=action_isaac)
                 q_target_isaac = action_isaac * self.cfg.action_scale + DEFAULT_QPOS
                 q_target_sdk = q_target_isaac[self.isaac2sdk]
 
+                # Safety check: if robot's gone over, taper kp/kd toward 0.
+                scale = 1.0
+                if self._safety is not None:
+                    root_z = float(snap.root_pos_world[2]) if snap.has_odo else float("nan")
+                    self._safety.update(step, root_z, float(snap.quat_wxyz[0]), snap.has_odo)
+                    scale = self._safety.gain_scale(step)
+
                 for i in range(29):
-                    self._lowcmd_msg.motor_cmd[i].q = float(q_target_sdk[i])
+                    m = self._lowcmd_msg.motor_cmd[i]
+                    m.q = float(q_target_sdk[i])
+                    if scale != 1.0:
+                        m.kp = float(self._kp_sdk[i] * scale)
+                        m.kd = float(self._kd_sdk[i] * scale)
                 self._lowcmd_msg.crc = self._crc.Crc(self._lowcmd_msg)
                 self._lowcmd_pub.Write(self._lowcmd_msg)
 
                 self.prev_action_isaac = action_isaac.copy()
                 step += 1
+                self._t_elapsed += period
+                self._render_frame()
                 if step % 50 == 0:  # once per sim second
                     root_z = snap.root_pos_world[2] if snap.has_odo else float("nan")
                     print(
@@ -315,6 +399,7 @@ class Bridge:
         finally:
             self.command.close()
             self.height_scan.close()
+            self._close_video()
 
 
 def _rot_inverse_quat(quat_wxyz: np.ndarray, v: np.ndarray) -> np.ndarray:
