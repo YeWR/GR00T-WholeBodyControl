@@ -72,6 +72,16 @@ class BridgeCfg:
     # Runtime safety: tilt / root-z triggered kp/kd taper.
     safety: SafetyCfg | None = None
     enable_safety: bool = True
+    # Soft-start: linearly ramp kp/kd from 0 → full over this many seconds at
+    # bridge startup. Matters a lot on real hardware where initial joint q can
+    # differ from DEFAULT_QPOS by 1+ rad (folded stance), and a step-load of
+    # kp=200 would demand hundreds of N·m on frame 1.
+    soft_start_s: float = 2.0
+    # On exit (normal, exception, or SIGINT/SIGTERM), publish this many
+    # control cycles of a "damp" LowCmd — kp=0, kd=kd_damp, q=current q — so
+    # motors settle smoothly instead of latching the last policy command.
+    shutdown_damp_steps: int = 25
+    shutdown_kd: float = 2.0
 
 
 class Bridge:
@@ -124,6 +134,10 @@ class Bridge:
         # Per-step kp/kd scale (1.0 healthy, ↘ 0 during fall taper).
         self._kp_sdk = None  # set in _prime_lowcmd
         self._kd_sdk = None
+        # Set by the signal handler — polled by the main policy loop.
+        self._stop_requested = False
+        # Wall-clock t0 for soft-start ramp (set in _start_default_hold_thread).
+        self._start_t: float = 0.0
 
     # ------------------------------------------------------------------ SDK
 
@@ -242,14 +256,25 @@ class Bridge:
         """Publish DEFAULT_QPOS at 50 Hz in a daemon thread. Used while the
         main thread is busy loading the policy so sonic's sim doesn't see
         multi-second command outages and let the robot flop to the floor.
+
+        Kp/Kd are ramped from 0 → full over ``cfg.soft_start_s`` so motors
+        don't yank the joints hard if initial q is far from ``DEFAULT_QPOS``
+        (common on a real robot starting from a folded stance).
         """
         period = 1.0 / self.cfg.control_hz
         default_sdk = DEFAULT_QPOS[self.isaac2sdk].astype(np.float32)
         for i in range(29):
             self._lowcmd_msg.motor_cmd[i].q = float(default_sdk[i])
 
+        self._start_t = time.monotonic()
+        soft = max(1e-3, float(self.cfg.soft_start_s))
+
         def loop():
             while not self._hold_stop.is_set():
+                ramp = min(1.0, (time.monotonic() - self._start_t) / soft)
+                for i in range(29):
+                    self._lowcmd_msg.motor_cmd[i].kp = float(self._kp_sdk[i] * ramp)
+                    self._lowcmd_msg.motor_cmd[i].kd = float(self._kd_sdk[i] * ramp)
                 self._lowcmd_msg.crc = self._crc.Crc(self._lowcmd_msg)
                 self._lowcmd_pub.Write(self._lowcmd_msg)
                 time.sleep(period)
@@ -305,7 +330,55 @@ class Bridge:
             print(f"[bridge] saved video to {self.cfg.video_path}")
             self._video_writer = None
 
+    def _shutdown_damp(self) -> None:
+        """Publish a few cycles of kp=0, kd=shutdown_kd, q=current_q so the
+        robot ends in a low-torque follow mode instead of latching the last
+        policy command. Best-effort: swallows exceptions so we always exit.
+        """
+        if self._lowcmd_msg is None or self._lowcmd_pub is None:
+            return
+        try:
+            period = 1.0 / self.cfg.control_hz
+            snap = self.state.snapshot()
+            q_now = snap.joint_pos_sdk.astype(np.float32).copy()
+            kd_damp = float(self.cfg.shutdown_kd)
+            for i in range(29):
+                m = self._lowcmd_msg.motor_cmd[i]
+                m.q = float(q_now[i])
+                m.dq = 0.0
+                m.kp = 0.0
+                m.kd = kd_damp
+                m.tau = 0.0
+            for _ in range(int(self.cfg.shutdown_damp_steps)):
+                self._lowcmd_msg.crc = self._crc.Crc(self._lowcmd_msg)
+                self._lowcmd_pub.Write(self._lowcmd_msg)
+                time.sleep(period)
+            print(f"[bridge] shutdown damp sent ({self.cfg.shutdown_damp_steps} cycles, "
+                  f"kd={kd_damp})")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bridge] shutdown damp failed: {exc}")
+
+    def _install_signal_handlers(self) -> None:
+        """Route SIGINT / SIGTERM through a flag so the policy loop exits
+        cleanly and ``finally`` (shutdown damp) runs. Without this, SIGTERM
+        kills Python mid-publish and the robot may latch the last command.
+        """
+        import signal
+
+        def handler(signum, _frame):  # noqa: ARG001
+            print(f"[bridge] signal {signum} received, shutting down")
+            self._stop_requested = True
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                # Not main thread — best-effort.
+                pass
+
     def run(self, max_steps: int | None = None) -> None:
+        # 0. Catch Ctrl-C / SIGTERM so finally (shutdown damp) actually runs.
+        self._install_signal_handlers()
         # 1. Bring up DDS channels ASAP so we can start publishing a holding
         #    command within ~100 ms of sim start — before gravity collapses
         #    the robot from qpos0.
@@ -348,7 +421,7 @@ class Bridge:
         self._t_elapsed = 0.0
         next_tick = time.monotonic()
         try:
-            while max_steps is None or step < max_steps:
+            while (max_steps is None or step < max_steps) and not self._stop_requested:
                 next_tick += period
                 snap = self.state.snapshot()
                 age = time.monotonic() - snap.last_update_monotonic
@@ -362,12 +435,16 @@ class Bridge:
                 q_target_isaac = action_isaac * self.cfg.action_scale + DEFAULT_QPOS
                 q_target_sdk = q_target_isaac[self.isaac2sdk]
 
-                # Safety check: if robot's gone over, taper kp/kd toward 0.
-                scale = 1.0
+                # Gain scale = soft-start ramp × safety taper. Both default 1.0
+                # (no effect); either can clamp kp/kd down.
+                soft = max(1e-3, float(self.cfg.soft_start_s))
+                soft_ramp = min(1.0, (time.monotonic() - self._start_t) / soft)
+                safety_scale = 1.0
                 if self._safety is not None:
                     root_z = float(snap.root_pos_world[2]) if snap.has_odo else float("nan")
                     self._safety.update(step, root_z, float(snap.quat_wxyz[0]), snap.has_odo)
-                    scale = self._safety.gain_scale(step)
+                    safety_scale = self._safety.gain_scale(step)
+                scale = soft_ramp * safety_scale
 
                 for i in range(29):
                     m = self._lowcmd_msg.motor_cmd[i]
@@ -375,6 +452,10 @@ class Bridge:
                     if scale != 1.0:
                         m.kp = float(self._kp_sdk[i] * scale)
                         m.kd = float(self._kd_sdk[i] * scale)
+                    else:
+                        # restore full gains after taper/ramp expired
+                        m.kp = float(self._kp_sdk[i])
+                        m.kd = float(self._kd_sdk[i])
                 self._lowcmd_msg.crc = self._crc.Crc(self._lowcmd_msg)
                 self._lowcmd_pub.Write(self._lowcmd_msg)
 
@@ -397,6 +478,9 @@ class Bridge:
                 else:
                     next_tick = time.monotonic()
         finally:
+            # Order matters: damp BEFORE closing DDS resources so the motors
+            # see the damp command. Then clean up I/O.
+            self._shutdown_damp()
             self.command.close()
             self.height_scan.close()
             self._close_video()
