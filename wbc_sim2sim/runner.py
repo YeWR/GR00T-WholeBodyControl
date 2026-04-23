@@ -23,6 +23,20 @@ def _install_patches(scene_xml_path):
     return rm
 
 
+def _apply_obs_variant_from_ckpt():
+    """Peek ``--ckpt`` out of ``sys.argv`` and install the 284-d obs variant
+    if the checkpoint needs it. Runs *after* sys.path is set by
+    ``_install_patches``."""
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--ckpt", type=str, required=False)
+    args, _ = parser.parse_known_args()
+    if not args.ckpt:
+        return
+    from .obs_variants import install_obs_variant_patches, peek_obs_dim
+    install_obs_variant_patches(peek_obs_dim(args.ckpt))
+
+
 def run(scene_xml_path=None):
     """Invoke the LeggedLab sim2sim CLI with our patches installed.
 
@@ -32,4 +46,5 @@ def run(scene_xml_path=None):
     scene_xml_path = scene_xml_path or DEFAULT_SCENE_XML
     os.environ.setdefault("MUJOCO_GL", "egl")
     rm = _install_patches(scene_xml_path)
+    _apply_obs_variant_from_ckpt()
     rm.main()
