@@ -206,6 +206,7 @@ class DefaultEnv:
                 mujoco.mj_forward(self.mj_model, self.mj_data)
                 self.viewer = None
         else:
+            self.elastic_band = None
             if self.onscreen:
                 self.viewer = mujoco.viewer.launch_passive(
                     self.mj_model, self.mj_data, show_left_ui=False, show_right_ui=False
@@ -421,6 +422,17 @@ class DefaultEnv:
             self.torques[self.right_hand_index - 1] = hand_torques[self.num_hand_dof :]
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
+
+        # Body MJCF actuators were switched to <position> (implicit PD with
+        # Isaac KP/KD) to match LeggedLab-wbc sim2sim's numerical behavior.
+        # Override the clipped-torque body slots with the raw q setpoint from
+        # rt/lowcmd so MuJoCo's implicit integrator runs the PD. Hand slots
+        # stay as <motor>/torque (no change).
+        if self.unitree_bridge is not None and self.unitree_bridge.low_cmd is not None:
+            for i in range(self.unitree_bridge.num_body_motor):
+                self.torques[self.body_joint_index[i] - 1] = (
+                    self.unitree_bridge.low_cmd.motor_cmd[i].q
+                )
 
         if self.config["FREE_BASE"]:
             # Prepend 6 zeros for the floating-base root DOF actuators

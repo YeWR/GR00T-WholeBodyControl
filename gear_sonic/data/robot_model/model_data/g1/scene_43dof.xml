@@ -2,6 +2,13 @@
   <include file="g1_29dof_with_hand.xml"/>
   <!-- Note that the hand model in g1_29dof_with_hand.xml is not stable for simulation. -->
 
+  <!-- Use implicitfast integrator so explicit-PD torque from rt/lowcmd
+       (kp≈200 for legs) doesn't oscillate/explode at 200 Hz sim dt.
+       Matches LeggedLab-wbc sim2sim's scene.xml; safe for sonic's stock
+       WBC controller since explicit-PD stability only improves. -->
+  <option timestep="0.005" integrator="implicitfast" iterations="10"
+          tolerance="1e-8" solver="Newton"/>
+
   <statistic center="0 0 0.5" extent="2.0"/>
 
   <visual>
