@@ -1,6 +1,6 @@
 # copy from g1_43dof_hist.yaml
 ROBOT_TYPE: 'g1_29dof' # Robot name, "go2", "b2", "b2w", "h1", "go2w", "g1" 
-ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml" # Robot scene, for Sim2Sim
+ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_legged.xml" # Robot scene, for Sim2Sim
 # ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_29dof_activated3dex.xml"
 
 DOMAIN_ID: 0 # Domain id
@@ -17,7 +17,7 @@ JOYSTICK_DEVICE: 0 # Joystick number
 FREE_BASE: False
 
 PRINT_SCENE_INFORMATION: True # Print link, joint and sensors information of robot
-ENABLE_ELASTIC_BAND: True # Virtual spring band, used for lifting h1
+ENABLE_ELASTIC_BAND: True # Patched in unitree_sdk2py_bridge.ElasticBand.Advance to be a safety net only — zero force above z=0.4m (no walking interference); pulls to 0.78m only when robot has fully fallen
 
 SIMULATE_DT: 0.005  # Need to be larger than the runtime of viewer.sync()
 VIEWER_DT: 0.02  # Viewer update time
@@ -149,8 +149,8 @@ WeakMotorJointIndex:
 
 NUM_MOTORS: 29
 NUM_JOINTS: 29
-NUM_HAND_MOTORS: 7
-NUM_HAND_JOINTS: 7
+NUM_HAND_MOTORS: 0
+NUM_HAND_JOINTS: 0
 NUM_UPPER_BODY_JOINTS: 17
 
 DEFAULT_DOF_ANGLES: [
@@ -417,3 +417,4 @@ motion_length_s: {
   "APT_level1": 7.66,
 
 }
+ENABLE_ONSCREEN: True

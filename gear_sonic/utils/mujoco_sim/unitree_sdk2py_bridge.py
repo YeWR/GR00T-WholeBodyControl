@@ -86,6 +86,13 @@ class UnitreeSdk2Bridge:
         self.right_hand_state_puber = ChannelPublisher("rt/dex3/right/state", HandState_)
         self.right_hand_state_puber.Init()
 
+        # Create locks BEFORE registering subscribers — otherwise the cyclonedds
+        # reader thread can fire LowCmdHandler before these attributes exist,
+        # raising AttributeError and silently killing the reader. (REDO_GUIDE 3h)
+        self.low_cmd_lock = threading.Lock()
+        self.left_hand_cmd_lock = threading.Lock()
+        self.right_hand_cmd_lock = threading.Lock()
+
         self.low_cmd_suber = ChannelSubscriber("rt/lowcmd", LowCmd_)
         self.low_cmd_suber.Init(self.LowCmdHandler, 1)
 
@@ -95,10 +102,6 @@ class UnitreeSdk2Bridge:
         self.right_hand_cmd = HandCmd_default()
         self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
         self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
-
-        self.low_cmd_lock = threading.Lock()
-        self.left_hand_cmd_lock = threading.Lock()
-        self.right_hand_cmd_lock = threading.Lock()
 
         self.wireless_controller = unitree_go_msg_dds__WirelessController_()
         self.wireless_controller_puber = ChannelPublisher(
@@ -145,6 +148,14 @@ class UnitreeSdk2Bridge:
             self.low_cmd = msg
             self.low_cmd_received = True
             self.new_low_cmd = True
+        # DEBUG — tag every 500th msg so we can confirm the handler is firing.
+        if not hasattr(self, "_dbg_n"):
+            self._dbg_n = 0
+        self._dbg_n += 1
+        if self._dbg_n % 250 == 0 or self._dbg_n == 1:
+            print(f"[bridge] LowCmdHandler fired #{self._dbg_n}  "
+                  f"q[0]={msg.motor_cmd[0].q:.3f}  kp[0]={msg.motor_cmd[0].kp:.0f}",
+                  flush=True)
 
     def LeftHandCmdHandler(self, msg):
         with self.left_hand_cmd_lock:
@@ -383,16 +394,16 @@ class ElasticBand:
         lin_vel = pose[7:10]
         ang_vel = pose[10:13]
 
-        δx = self.point - pos
-        f = self.kp_pos * (δx + np.array([0, 0, self.length])) + self.kd_pos * (0 - lin_vel)
-
-        # Convert quaternion from MuJoCo [w,x,y,z] to scipy [x,y,z,w]
-        quat = np.array([quat[1], quat[2], quat[3], quat[0]])
-        rot = scipy.spatial.transform.Rotation.from_quat(quat)
-        rotvec = rot.as_rotvec()
-        torque = -self.kp_ang * rotvec - self.kd_ang * ang_vel
-
-        return np.concatenate([f, torque])
+        # PATCH: safety-net only.
+        # - No force when robot is above 0.4m (free walking, no XY pull).
+        # - When robot has fallen below 0.4m, apply z-only restoring force
+        #   pulling toward 0.78m (default standing pelvis height).
+        # - No angular torque (don't fight robot orientation).
+        if pos[2] > 0.4:
+            return np.zeros(6)
+        fz = self.kp_pos * (0.78 - pos[2]) + self.kd_pos * (0.0 - lin_vel[2])
+        f = np.array([0.0, 0.0, fz])
+        return np.concatenate([f, np.zeros(3)])
 
     def MujuocoKeyCallback(self, key):
         import glfw

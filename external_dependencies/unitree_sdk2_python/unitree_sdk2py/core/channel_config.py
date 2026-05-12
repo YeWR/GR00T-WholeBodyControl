@@ -3,7 +3,7 @@ ChannelConfigHasInterface = '''<?xml version="1.0" encoding="UTF-8" ?>
         <Domain Id="any">
             <General>
                 <Interfaces>
-                    <NetworkInterface name="$__IF_NAME__$" priority="default" multicast="default"/>
+                    <NetworkInterface name="$__IF_NAME__$" priority="default" multicast="true"/>
                 </Interfaces>
             </General>
             <Tracing>
@@ -18,7 +18,7 @@ ChannelConfigAutoDetermine = '''<?xml version="1.0" encoding="UTF-8" ?>
         <Domain Id="any">
             <General>
                 <Interfaces>
-                    <NetworkInterface autodetermine=\"true\" priority=\"default\" multicast=\"default\" />
+                    <NetworkInterface autodetermine=\"true\" priority=\"default\" multicast=\"true\" />
                 </Interfaces>
             </General>
         </Domain>
