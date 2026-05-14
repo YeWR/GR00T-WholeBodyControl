@@ -86,6 +86,13 @@ class UnitreeSdk2Bridge:
         self.right_hand_state_puber = ChannelPublisher("rt/dex3/right/state", HandState_)
         self.right_hand_state_puber.Init()
 
+        # Create locks BEFORE registering subscribers — otherwise the cyclonedds
+        # reader thread can fire LowCmdHandler before these attributes exist,
+        # raising AttributeError and silently killing the reader. (REDO_GUIDE 3h)
+        self.low_cmd_lock = threading.Lock()
+        self.left_hand_cmd_lock = threading.Lock()
+        self.right_hand_cmd_lock = threading.Lock()
+
         self.low_cmd_suber = ChannelSubscriber("rt/lowcmd", LowCmd_)
         self.low_cmd_suber.Init(self.LowCmdHandler, 1)
 
@@ -95,10 +102,6 @@ class UnitreeSdk2Bridge:
         self.right_hand_cmd = HandCmd_default()
         self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
         self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
-
-        self.low_cmd_lock = threading.Lock()
-        self.left_hand_cmd_lock = threading.Lock()
-        self.right_hand_cmd_lock = threading.Lock()
 
         self.wireless_controller = unitree_go_msg_dds__WirelessController_()
         self.wireless_controller_puber = ChannelPublisher(
@@ -145,6 +148,14 @@ class UnitreeSdk2Bridge:
             self.low_cmd = msg
             self.low_cmd_received = True
             self.new_low_cmd = True
+        # DEBUG — tag every 500th msg so we can confirm the handler is firing.
+        if not hasattr(self, "_dbg_n"):
+            self._dbg_n = 0
+        self._dbg_n += 1
+        if self._dbg_n % 250 == 0 or self._dbg_n == 1:
+            print(f"[bridge] LowCmdHandler fired #{self._dbg_n}  "
+                  f"q[0]={msg.motor_cmd[0].q:.3f}  kp[0]={msg.motor_cmd[0].kp:.0f}",
+                  flush=True)
 
     def LeftHandCmdHandler(self, msg):
         with self.left_hand_cmd_lock:

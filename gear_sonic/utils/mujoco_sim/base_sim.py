@@ -49,16 +49,17 @@ class DefaultEnv:
         self.sim_dt = self.config["SIMULATE_DT"]
         self.obs = None
         self.torques = np.zeros(self.num_body_dof + self.num_hand_dof * 2)
-        self.torque_limit = np.array(self.robot.MOTOR_EFFORT_LIMIT_LIST)
+        # Truncate to match torques length — original YAML has 43 entries
+        # (29 body + 14 hand), but the LeggedLab MJCF has only 29 body actuators.
+        self.torque_limit = np.array(self.robot.MOTOR_EFFORT_LIMIT_LIST[:self.torques.shape[0]])
         self.camera_configs = camera_configs
-
-        if not camera_configs and offscreen and enable_image_publish:
-            self.camera_configs = {
-                "ego_view": {"height": 480, "width": 640, "mjcf_name": "head_camera"},
-            }
 
         self.reward_lock = Lock()
         self.unitree_bridge = None
+        # Force offscreen-only when SONIC_RECORD_MP4 is set — avoids GLFW/X11
+        # viewer init which fails on headless / SSH sessions without DISPLAY.
+        if os.environ.get("SONIC_RECORD_MP4"):
+            onscreen = False
         self.onscreen = onscreen
 
         self.init_scene()
@@ -149,6 +150,40 @@ class DefaultEnv:
         xml_path = str(pathlib.Path(GEAR_SONIC_ROOT) / self.config["ROBOT_SCENE"])
         self.mj_model = mujoco.MjModel.from_xml_path(xml_path)
         self.mj_data = mujoco.MjData(self.mj_model)
+        # Spawn at LeggedLab training default pose (in-distribution for the policy).
+        legged_lab_default = {
+            "left_hip_pitch_joint":   -0.20,  "right_hip_pitch_joint":  -0.20,
+            "left_hip_roll_joint":     0.00,  "right_hip_roll_joint":    0.00,
+            "left_hip_yaw_joint":      0.00,  "right_hip_yaw_joint":     0.00,
+            "left_knee_joint":         0.42,  "right_knee_joint":        0.42,
+            "left_ankle_pitch_joint": -0.23,  "right_ankle_pitch_joint":-0.23,
+            "left_ankle_roll_joint":   0.00,  "right_ankle_roll_joint":  0.00,
+            "waist_yaw_joint":         0.00,  "waist_roll_joint":        0.00,  "waist_pitch_joint":   0.00,
+            "left_shoulder_pitch_joint":  0.35, "right_shoulder_pitch_joint": 0.35,
+            "left_shoulder_roll_joint":   0.18, "right_shoulder_roll_joint": -0.18,
+            "left_shoulder_yaw_joint":    0.00, "right_shoulder_yaw_joint":   0.00,
+            "left_elbow_joint":           0.87, "right_elbow_joint":          0.87,
+            "left_wrist_roll_joint":      0.00, "right_wrist_roll_joint":     0.00,
+            "left_wrist_pitch_joint":     0.00, "right_wrist_pitch_joint":    0.00,
+            "left_wrist_yaw_joint":       0.00, "right_wrist_yaw_joint":      0.00,
+        }
+        for jname, qval in legged_lab_default.items():
+            jid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+            if jid >= 0:
+                self.mj_data.qpos[int(self.mj_model.jnt_qposadr[jid])] = qval
+        # Pelvis: walk-nominal height (matches LeggedLab sim2sim init_base_pos=0.80).
+        if self.mj_model.njnt > 0 and int(self.mj_model.jnt_type[0]) == int(mujoco.mjtJoint.mjJNT_FREE):
+            self.mj_data.qpos[0:3] = (0.0, 0.0, 0.80)
+            self.mj_data.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)
+            self.mj_data.qvel[0:6] = 0.0
+        # Seed actuator ctrl to the spawn qpos so position actuators don't pull
+        # joints away from default before our controller's first lowcmd lands.
+        for jname, qval in legged_lab_default.items():
+            jid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+            aid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_ACTUATOR, jname.replace("_joint", ""))
+            if aid >= 0:
+                self.mj_data.ctrl[aid] = qval
+        mujoco.mj_forward(self.mj_model, self.mj_data)
         self.mj_model.opt.timestep = self.sim_dt
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.root_body = "pelvis"
@@ -181,6 +216,11 @@ class DefaultEnv:
                     "The absolute static root will make the simulation unstable."
                 )
 
+        # Default to no elastic band; later code paths gate on `self.elastic_band`
+        # truthiness, but reference it unconditionally if it was never assigned
+        # (when ENABLE_ELASTIC_BAND=False, viewer launch and key handler still
+        # run and would AttributeError without this).
+        self.elastic_band = None
         # Enable the elastic band
         if self.config["ENABLE_ELASTIC_BAND"] and self.use_floating_root_link:
             self.elastic_band = ElasticBand()
@@ -206,7 +246,6 @@ class DefaultEnv:
                 mujoco.mj_forward(self.mj_model, self.mj_data)
                 self.viewer = None
         else:
-            self.elastic_band = None
             if self.onscreen:
                 self.viewer = mujoco.viewer.launch_passive(
                     self.mj_model, self.mj_data, show_left_ui=False, show_right_ui=False
@@ -257,36 +296,38 @@ class DefaultEnv:
             self.renderers[camera_name] = renderer
 
     def compute_body_torques(self) -> np.ndarray:
-        # PD control: tau = tau_ff + kp * (q_des - q) + kd * (dq_des - dq)
-        body_torques = np.zeros(self.num_body_dof)
+        """Return body actuator ctrl values.
+
+        After the MJCF was patched to use <position> actuators for the 29 body
+        joints (see g1_29dof_with_hand.xml), the actuator ctrl input is the
+        TARGET POSITION (rad), not torque.  MuJoCo's position actuator does
+        the implicit PD internally with the kp/kv specified in the MJCF, which
+        matches IsaacLab's ImplicitActuatorCfg behavior used during training.
+
+        Hand actuators remain <motor> so their ctrl is still torque (zero by
+        default).  The mixed ctrl array is a no-op for the position-actuator
+        clipping at ±torque_limit since target q values are within ±3 rad.
+        """
+        body_target_q = np.zeros(self.num_body_dof)
         if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
-            for i in range(self.unitree_bridge.num_body_motor):
-                if self.unitree_bridge.use_sensor:
-                    body_torques[i] = (
-                        self.unitree_bridge.low_cmd.motor_cmd[i].tau
-                        + self.unitree_bridge.low_cmd.motor_cmd[i].kp
-                        * (self.unitree_bridge.low_cmd.motor_cmd[i].q - self.mj_data.sensordata[i])
-                        + self.unitree_bridge.low_cmd.motor_cmd[i].kd
-                        * (
-                            self.unitree_bridge.low_cmd.motor_cmd[i].dq
-                            - self.mj_data.sensordata[i + self.unitree_bridge.num_body_motor]
-                        )
-                    )
-                else:
-                    body_torques[i] = (
-                        self.unitree_bridge.low_cmd.motor_cmd[i].tau
-                        + self.unitree_bridge.low_cmd.motor_cmd[i].kp
-                        * (
-                            self.unitree_bridge.low_cmd.motor_cmd[i].q
-                            - self.mj_data.qpos[self.body_joint_index[i] + self.qpos_offset - 1]
-                        )
-                        + self.unitree_bridge.low_cmd.motor_cmd[i].kd
-                        * (
-                            self.unitree_bridge.low_cmd.motor_cmd[i].dq
-                            - self.mj_data.qvel[self.body_joint_index[i] + self.qvel_offset - 1]
-                        )
-                    )
-        return body_torques
+            # If no controller cmd has landed yet, hold the LeggedLab default
+            # pose so the robot stands stable (PD active) instead of dropping
+            # to zero or free-falling under gravity.  Matches DEFAULT_QPOS in
+            # init_scene.  Dict order = DDS body motor order.
+            if not getattr(self.unitree_bridge, "low_cmd_received", False):
+                _LL_DEFAULT_DDS = (
+                    -0.20, 0.00, 0.00, 0.42, -0.23, 0.00,
+                    -0.20, 0.00, 0.00, 0.42, -0.23, 0.00,
+                     0.00, 0.00, 0.00,
+                     0.35, 0.18, 0.00, 0.87, 0.00, 0.00, 0.00,
+                     0.35,-0.18, 0.00, 0.87, 0.00, 0.00, 0.00,
+                )
+                for i in range(self.unitree_bridge.num_body_motor):
+                    body_target_q[i] = _LL_DEFAULT_DDS[i] if i < len(_LL_DEFAULT_DDS) else 0.0
+            else:
+                for i in range(self.unitree_bridge.num_body_motor):
+                    body_target_q[i] = self.unitree_bridge.low_cmd.motor_cmd[i].q
+        return body_target_q
 
     def get_head_pose(self) -> np.ndarray:
         root_pos = self.mj_data.body("torso_link").xpos.copy()
@@ -390,6 +431,22 @@ class DefaultEnv:
     def sim_step(self):
         self.obs = self.prepare_obs()
         self.unitree_bridge.PublishLowState(self.obs)
+        # DEBUG: log root_z + qpos[hip_pitch] + qpos[knee] every ~5s.
+        if not hasattr(self, "_dbg_n"):
+            self._dbg_n = 0
+        self._dbg_n += 1
+        if self._dbg_n % 1000 == 0:
+            rx = float(self.mj_data.qpos[0])
+            ry = float(self.mj_data.qpos[1])
+            rz = float(self.mj_data.qpos[2])
+            # base linear vel (qvel[0:3] is world-frame for free joint)
+            vx_w = float(self.mj_data.qvel[0])
+            vy_w = float(self.mj_data.qvel[1])
+            wz_w = float(self.mj_data.qvel[5])
+            print(f"[sim] t={self._dbg_n*self.sim_dt:5.2f}s  "
+                  f"root_xyz=({rx:+.2f},{ry:+.2f},{rz:+.2f})  "
+                  f"vel_w=({vx_w:+.2f},{vy_w:+.2f}) wz={wz_w:+.2f}",
+                  flush=True)
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
         if self.elastic_band:
@@ -422,17 +479,6 @@ class DefaultEnv:
             self.torques[self.right_hand_index - 1] = hand_torques[self.num_hand_dof :]
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
-
-        # Body MJCF actuators were switched to <position> (implicit PD with
-        # Isaac KP/KD) to match LeggedLab-wbc sim2sim's numerical behavior.
-        # Override the clipped-torque body slots with the raw q setpoint from
-        # rt/lowcmd so MuJoCo's implicit integrator runs the PD. Hand slots
-        # stay as <motor>/torque (no change).
-        if self.unitree_bridge is not None and self.unitree_bridge.low_cmd is not None:
-            for i in range(self.unitree_bridge.num_body_motor):
-                self.torques[self.body_joint_index[i] - 1] = (
-                    self.unitree_bridge.low_cmd.motor_cmd[i].q
-                )
 
         if self.config["FREE_BASE"]:
             # Prepend 6 zeros for the floating-base root DOF actuators
@@ -467,6 +513,46 @@ class DefaultEnv:
     def update_viewer(self):
         if self.viewer is not None:
             self.viewer.sync()
+        # Optional offscreen recorder — set env SONIC_RECORD_MP4=/path to enable.
+        # Uses cv2.VideoWriter (opencv-python is already a SONIC dep).
+        rec_path = os.environ.get("SONIC_RECORD_MP4")
+        if rec_path:
+            if not hasattr(self, "_rec_writer"):
+                import cv2
+                os.environ.setdefault("MUJOCO_GL", "egl")
+                W, H = 1280, 720
+                self._rec_renderer = mujoco.Renderer(self.mj_model, height=H, width=W)
+                fps = int(round(1.0 / max(self.config.get("VIEWER_DT", 0.02), 0.001)))
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                self._rec_writer = cv2.VideoWriter(rec_path, fourcc, fps, (W, H))
+                self._rec_cam = mujoco.MjvCamera()
+                self._rec_cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                self._rec_cam.trackbodyid = self.mj_model.body("pelvis").id
+                self._rec_cam.distance = 2.5
+                self._rec_cam.azimuth = 120
+                self._rec_cam.elevation = -20
+                self._rec_cv2 = cv2
+                print(f"[sim] recording mp4 ({W}x{H} @ {fps}fps) → {rec_path}", flush=True)
+                # Make sure cv2.VideoWriter is finalized on SIGTERM / SIGINT /
+                # normal exit so the mp4 moov atom is written. Without this,
+                # kill -TERM / kill -9 leaves a header-less mp4 ffmpeg can't read.
+                import atexit, signal as _signal
+                _wr = self._rec_writer
+                def _flush(*_a):
+                    try:
+                        _wr.release()
+                        print("[sim] mp4 writer released", flush=True)
+                    except Exception:
+                        pass
+                atexit.register(_flush)
+                def _term(*_a):
+                    _flush()
+                    os._exit(0)
+                _signal.signal(_signal.SIGTERM, _term)
+                _signal.signal(_signal.SIGINT, _term)
+            self._rec_renderer.update_scene(self.mj_data, camera=self._rec_cam)
+            frame_rgb = self._rec_renderer.render()  # (H,W,3) uint8 RGB
+            self._rec_writer.write(self._rec_cv2.cvtColor(frame_rgb, self._rec_cv2.COLOR_RGB2BGR))
 
     def update_viewer_camera(self):
         if self.viewer is not None:
@@ -495,8 +581,6 @@ class DefaultEnv:
             renderer = self.renderers[camera_name]
             if "params" in camera_config:
                 renderer.update_scene(self.mj_data, camera=camera_config["params"])
-            elif "mjcf_name" in camera_config:
-                renderer.update_scene(self.mj_data, camera=camera_config["mjcf_name"])
             else:
                 renderer.update_scene(self.mj_data, camera=camera_name)
             render_caches[camera_name + "_image"] = renderer.render()
@@ -537,6 +621,42 @@ class DefaultEnv:
 
     def reset(self):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
+        # Spawn robot at the LeggedLab training default pose so the policy
+        # sees an in-distribution start.  Without this MuJoCo's reset puts
+        # joints near zero (e.g., legs straight) which is far from the deep
+        # crouch + hand-forward pose the policy was trained at — the policy
+        # would output |a|≈9 trying to recover before contact dynamics even
+        # stabilize.
+        legged_lab_default = {
+            "left_hip_pitch_joint":   -0.20,  "right_hip_pitch_joint":  -0.20,
+            "left_hip_roll_joint":     0.00,  "right_hip_roll_joint":    0.00,
+            "left_hip_yaw_joint":      0.00,  "right_hip_yaw_joint":     0.00,
+            "left_knee_joint":         0.42,  "right_knee_joint":        0.42,
+            "left_ankle_pitch_joint": -0.23,  "right_ankle_pitch_joint":-0.23,
+            "left_ankle_roll_joint":   0.00,  "right_ankle_roll_joint":  0.00,
+            "waist_yaw_joint":         0.00,
+            "waist_roll_joint":        0.00,
+            "waist_pitch_joint":       0.00,
+            "left_shoulder_pitch_joint":  0.35, "right_shoulder_pitch_joint": 0.35,
+            "left_shoulder_roll_joint":   0.18, "right_shoulder_roll_joint": -0.18,
+            "left_shoulder_yaw_joint":    0.00, "right_shoulder_yaw_joint":   0.00,
+            "left_elbow_joint":           0.87, "right_elbow_joint":          0.87,
+            "left_wrist_roll_joint":      0.00, "right_wrist_roll_joint":     0.00,
+            "left_wrist_pitch_joint":     0.00, "right_wrist_pitch_joint":    0.00,
+            "left_wrist_yaw_joint":       0.00, "right_wrist_yaw_joint":      0.00,
+        }
+        for jname, qval in legged_lab_default.items():
+            jid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+            if jid >= 0:
+                self.mj_data.qpos[int(self.mj_model.jnt_qposadr[jid])] = qval
+        # Pelvis: stand at nominal walk height, identity orientation, zero velocity.
+        if self.use_floating_root_link and self.mj_model.njnt > 0 and \
+                int(self.mj_model.jnt_type[0]) == int(mujoco.mjtJoint.mjJNT_FREE):
+            self.mj_data.qpos[0:3] = (0.0, 0.0, 0.74)
+            self.mj_data.qpos[3:7] = (1.0, 0.0, 0.0, 0.0)  # w,x,y,z
+            self.mj_data.qvel[0:6] = 0.0
+        # Settle kinematics so contact / inertia caches are consistent.
+        mujoco.mj_forward(self.mj_model, self.mj_data)
 
 
 class BaseSimulator:
