@@ -380,8 +380,8 @@ class ElasticBand:
     """
 
     def __init__(self):
-        self.kp_pos = 10000
-        self.kd_pos = 1000
+        self.kp_pos = 0
+        self.kd_pos = 0
         self.kp_ang = 1000
         self.kd_ang = 10
         self.point = np.array([0, 0, 1])
