@@ -7,6 +7,7 @@ Sonic's ``meshes/`` has subdirectories (``images/``, ``meshes_2F85/``,
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -15,7 +16,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SCENE_XML = (
     REPO_ROOT / "gear_sonic" / "data" / "robots" / "g1" / "scene_29dof_sim2sim.xml"
 )
-LEGGED_SIM2SIM_DIR = Path("/home/weirui/codes/LeggedLab-wbc/sim2sim")
+# Resolve LeggedLab-wbc's sim2sim package. Override via $LEGGED_LAB_WBC_REPO
+# (or $LEGGED_SIM2SIM_DIR for the path itself); fall back to ~/codes/LeggedLab-wbc
+# which is where our install.md puts it.
+_env_pkg = os.environ.get("LEGGED_SIM2SIM_DIR")
+if _env_pkg:
+    LEGGED_SIM2SIM_DIR = Path(_env_pkg).expanduser().resolve()
+else:
+    _ll_repo = os.environ.get(
+        "LEGGED_LAB_WBC_REPO", str(Path.home() / "codes" / "LeggedLab-wbc")
+    )
+    LEGGED_SIM2SIM_DIR = Path(_ll_repo).expanduser().resolve() / "sim2sim"
 
 
 def build_patched_mjcf(scene_xml_path: str | Path):

@@ -450,6 +450,10 @@ class DefaultEnv:
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
         if self.elastic_band:
+            _release = float(os.environ.get("SONIC_ELASTIC_BAND_RELEASE_AFTER_S", "-1"))
+            if _release >= 0 and self.elastic_band.enable and (self._dbg_n * self.sim_dt) >= _release:
+                self.elastic_band.enable = False
+                print(f"[sim] elastic_band released at t={self._dbg_n*self.sim_dt:.2f}s", flush=True)
             if self.elastic_band.enable and self.use_floating_root_link:
                 pose = np.concatenate(
                     [
